@@ -14,6 +14,8 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
@@ -138,7 +140,7 @@ namespace Serilog.Sinks
 
         #endregion
 
-        private int GetStringSizeInBytes(int stringLength)
+        private long GetStringSizeInBytes(long stringLength)
         {
             return sizeof(char) * stringLength;
         }
@@ -148,73 +150,79 @@ namespace Serilog.Sinks
             if ((logEventsBatch == null) || (logEventsBatch.Count == 0))
                 return true;
 
-            var logEventJsonBuilder = new StringBuilder();
-            var result = true;
-            var counter = 0;
+            var processedCount = 0;
 
-            foreach (var logEvent in logEventsBatch) {
-                var jsonString = JsonConvert.SerializeObject(
-                    JObject.FromObject(logEvent.Dictionary(_storeTimestampInUtc, _formatProvider), _jsonSerializer)
-                           .Flaten(),
-                    _jsonSerializerSettings);
+            using(var ms = new MemoryStream())
+            using (var streamWriter = new StreamWriter(ms, Encoding.UTF8))
+            {
+                do
+                {
+                    var currentBatchSize = 0;
+                    streamWriter.Write("[");
+                    var currentEventsBatch = logEventsBatch.Skip(processedCount).ToArray();
+                    foreach (var logEvent in currentEventsBatch)
+                    {
+                        var jsonString = JsonConvert.SerializeObject(
+                            JObject.FromObject(logEvent.Dictionary(_storeTimestampInUtc, _formatProvider),
+                                    _jsonSerializer)
+                                .Flaten(),
+                            _jsonSerializerSettings);
 
-                if (GetStringSizeInBytes(jsonString.Length) >= MaximumMessageSize) {
-                    counter--;
-                    SelfLog.WriteLine("Log size is more than 32 MB. Consider sending smaller message");
-                    SelfLog.WriteLine("Dropping invalid message");
-                    continue;
-                }
+                        if (currentBatchSize > 0)
+                            streamWriter.Write(",");
 
-                if (GetStringSizeInBytes(logEventJsonBuilder.Length + jsonString.Length) > MaximumMessageSize) {
+                        var currentEventSizeBytes = GetStringSizeInBytes(jsonString.Length);
+                        if (currentEventSizeBytes >= MaximumMessageSize)
+                        {
+                            currentBatchSize--;
+                            SelfLog.WriteLine("Log size is more than 32 MB. Consider sending smaller message");
+                            SelfLog.WriteLine("Dropping invalid message");
+                            continue;
+                        }
 
-                    SelfLog.WriteLine($"Sending mini batch of size {counter}");
-                    result = await SendLogMessage(logEventJsonBuilder);
-                    if (!result) {
-                        return false;
+                        if (ms.Length + currentEventSizeBytes > MaximumMessageSize)
+                        {
+                            break;
+                        }
+
+                        streamWriter.Write(jsonString);
+                        currentBatchSize++;
                     }
 
-                    counter = 0;
-                    logEventJsonBuilder.Clear();
-                }
-                
-                logEventJsonBuilder.Append(jsonString);
-                logEventJsonBuilder.Append(",");
-                counter++;
-            }
+                    streamWriter.Write("]");
+                    streamWriter.Flush();
+                    ms.Seek(0, SeekOrigin.Begin);
 
-            if (counter < logEventsBatch.Count) {
-                SelfLog.WriteLine($"Sending mini batch of size {counter}");
-            }
+                    if (currentBatchSize < logEventsBatch.Count)
+                    {
+                        SelfLog.WriteLine($"Sending mini batch of size {currentBatchSize}");
+                    }
 
-            return result && await SendLogMessage(logEventJsonBuilder);;
+                    var res = await SendLogMessage(ms);
+                    processedCount += currentEventsBatch.Length;
+                    if (!res) return false;
+                } while (processedCount < logEventsBatch.Count);
+
+                return true;
+            }
         }
 
-        private async Task<bool> SendLogMessage(StringBuilder logEventJsonBuilder)
+        private async Task<bool> SendLogMessage(Stream stream)
         {
-            if (logEventJsonBuilder.Length > 0)
-                logEventJsonBuilder.Remove(logEventJsonBuilder.Length - 1, 1);
+            // contains only "[]"
+            if (stream.Length <= 2) return false;
+            
+            var dateString = DateTime.UtcNow.ToString("r");
+            var hashedString = BuildSignature(stream.Length, dateString, _authenticationId);
+            var signature = $"SharedKey {_workSpaceId}:{hashedString}";
 
-            if (logEventJsonBuilder.Length > 0) {
-                logEventJsonBuilder.Insert(0, "[");
-                logEventJsonBuilder.Append("]");
+            var result = await PostDataAsync(signature, dateString, stream).ConfigureAwait(false);
 
-
-                var logEventJsonString = logEventJsonBuilder.ToString();
-                var contentLength = Encoding.UTF8.GetByteCount(logEventJsonString);
-
-                var dateString = DateTime.UtcNow.ToString("r");
-                var hashedString = BuildSignature(contentLength, dateString, _authenticationId);
-                var signature = $"SharedKey {_workSpaceId}:{hashedString}";
-
-                var result = await PostDataAsync(signature, dateString, logEventJsonString).ConfigureAwait(false);
-
-                return result;
-            }
-
-            return false;
+            return result;
+            
         }
 
-        private static string BuildSignature(int contentLength, string dateString, string key)
+        private static string BuildSignature(long contentLength, string dateString, string key)
         {
             var stringToHash =
                 "POST\n" + contentLength + "\napplication/json\n" + "x-ms-date:" + dateString + "\n/api/logs";
@@ -227,7 +235,7 @@ namespace Serilog.Sinks
             }
         }
 
-        private async Task<bool> PostDataAsync(string signature, string dateString, string jsonString)
+        private async Task<bool> PostDataAsync(string signature, string dateString, Stream stream)
         {
             try {
                 await _semaphore.WaitAsync().ConfigureAwait(false);
@@ -236,11 +244,11 @@ namespace Serilog.Sinks
                 Client.DefaultRequestHeaders.Add("Authorization", signature);
                 Client.DefaultRequestHeaders.Add("x-ms-date", dateString);
 
-                var stringContent = new StringContent(jsonString);
-                stringContent.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json");
-                stringContent.Headers.Add("Log-Type", _logName);
+                var streamContent = new StreamContent(stream);
+                streamContent.Headers.ContentType = MediaTypeHeaderValue.Parse("application/json");
+                streamContent.Headers.Add("Log-Type", _logName);
 
-                var response = await Client.PostAsync(_analyticsUrl, stringContent).ConfigureAwait(false);
+                var response = await Client.PostAsync(_analyticsUrl, streamContent).ConfigureAwait(false);
                 var message = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                 SelfLog.WriteLine("{0}: {1}", response.ReasonPhrase, message);
